@@ -1,0 +1,40 @@
+name: Hikvision mail -> FTP
+
+on:
+  schedule:
+    # Раз в 30 минут: укладываемся в бесплатные 2000 минут/мес приватного репозитория
+    # (каждый запуск засчитывается минимум как 1 минута)
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Только показать, ничего не загружать"
+        type: boolean
+        default: false
+
+# Не запускать два прохода одновременно
+concurrency:
+  group: hik-mail2ftp
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Mail -> FTP
+        env:
+          IMAP_USER: ${{ secrets.IMAP_USER }}
+          IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          TZ: Europe/Kyiv
+        run: |
+          python hik_mail2ftp.py ${{ inputs.dry_run && '--dry-run' || '' }}
