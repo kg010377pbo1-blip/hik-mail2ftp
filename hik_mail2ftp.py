@@ -5,7 +5,8 @@ Hikvision NVR/DVR -> Gmail -> FTP.
 Забирает непрочитанные письма от регистратора Hikvision из ящика Gmail (IMAP),
 вытаскивает фото из вложений и заливает их на FTP.
 После успешной загрузки письмо помечается прочитанным и получает метку Gmail
-(по умолчанию "hik-processed"). Если загрузка не удалась — письмо остаётся
+(по умолчанию "hik-processed"), а при delete_after_upload = true — уходит
+в Корзину Gmail. Если загрузка не удалась — письмо остаётся
 непрочитанным и будет обработано при следующем запуске.
 
 Только стандартная библиотека Python 3.8+.
@@ -74,6 +75,7 @@ def load_config(path):
         "imap_from": get("imap", "from_filter", ""),
         "imap_subject": get("imap", "subject_filter", ""),
         "done_label": get("imap", "processed_label", "hik-processed"),
+        "delete_after": get_bool("imap", "delete_after_upload", False),
         "ftp_host": get("ftp", "host", required=True),
         "ftp_port": int(get("ftp", "port", "21")),
         "ftp_user": get("ftp", "user", required=True),
@@ -268,6 +270,8 @@ def run_once(c, dry_run=False):
             return 0
         uids = uids[: c["max_per_run"]]
         log.info("Найдено писем: %d", len(uids))
+        is_gmail = "gmail" in c["imap_host"]
+        deleted, need_expunge = 0, False
 
         uploaded_total = 0
         uploader = None if dry_run else FtpUploader(c).__enter__()
@@ -301,11 +305,25 @@ def run_once(c, dry_run=False):
                         raise
                 if not dry_run:
                     imap.uid("STORE", uid, "+FLAGS", "(\\Seen)")
-                    if c["done_label"] and "gmail" in c["imap_host"]:
+                    if c["done_label"] and is_gmail:
                         imap.uid("STORE", uid, "+X-GM-LABELS", imap_quote(c["done_label"]))
+                    # Удаляем только письма, фото из которых уже на FTP;
+                    # письма без картинок (потеря видео, ошибка диска...) остаются
+                    if c["delete_after"] and images:
+                        if is_gmail:
+                            # В Gmail — в Корзину (очищается сама через 30 дней)
+                            imap.uid("STORE", uid, "+X-GM-LABELS", "(\\Trash)")
+                        else:
+                            imap.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+                            need_expunge = True
+                        deleted += 1
         finally:
             if uploader:
                 uploader.__exit__(None, None, None)
+            if need_expunge:
+                imap.expunge()
+            if deleted:
+                log.info("Удалено писем: %d", deleted)
         log.info("Готово, загружено файлов: %d", uploaded_total)
         return uploaded_total
     finally:
