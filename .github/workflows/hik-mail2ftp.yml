@@ -2,9 +2,9 @@ name: Hikvision mail -> FTP
 
 on:
   schedule:
-    # Раз в 30 минут: укладываемся в бесплатные 2000 минут/мес приватного репозитория
-    # (каждый запуск засчитывается минимум как 1 минута)
-    - cron: "*/30 * * * *"
+    # 4 раза в день: 06:00, 12:00, 18:00, 00:00 по Киеву летом (UTC+3);
+    # зимой (UTC+2) — на час раньше. GitHub может запускать с опозданием.
+    - cron: "0 3,9,15,21 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -20,7 +20,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
