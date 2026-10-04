@@ -27,6 +27,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        # torch только для CPU: в разы меньше обычного пакета
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
 
       - name: Mail -> FTP
         env:
@@ -35,6 +43,8 @@ jobs:
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
           TZ: Europe/Kyiv
         run: |
           python hik_mail2ftp.py ${{ inputs.dry_run && '--dry-run' || '' }}
