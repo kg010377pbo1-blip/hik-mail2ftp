@@ -9,7 +9,11 @@ Hikvision NVR/DVR -> Gmail -> FTP.
 в Корзину Gmail. Если загрузка не удалась — письмо остаётся
 непрочитанным и будет обработано при следующем запуске.
 
-Только стандартная библиотека Python 3.8+.
+Дополнительно (analyze.py): детектор находит людей, машины, собак и кошек на
+фото из писем и на новых фото другого регистратора в папках IPCAM_HOME* на FTP,
+а после прогона на почту уходит отчёт с текстом от Claude.
+
+Почта и FTP — только стандартная библиотека Python 3.8+; анализу нужен requirements.txt.
 
 Запуск:
     python hik_mail2ftp.py              # один проход
@@ -24,14 +28,16 @@ import email.policy
 import ftplib
 import imaplib
 import io
+import json
 import logging
 import os
 import queue
 import re
 import sys
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 log = logging.getLogger("hik_mail2ftp")
@@ -52,6 +58,19 @@ RE_DEVICE = re.compile(r"(?:NVR|DVR|DEVICE)\s*NAME\s*:\s*(.+)", re.I)
 RE_CAM_ALL = re.compile(r"([^\n(),:]+?)\s*\(\s*(D\d+)\s*\)", re.I)
 # Канал из имени вложения: "D04-1.jpg" -> D4
 RE_IMG_CH = re.compile(r"^D0*(\d+)[-_]", re.I)
+# Папка-дата другого регистратора: "2026_10_04-2026_10_04" (последняя дата — конец)
+RE_DATE_DIR = re.compile(r"(\d{4})_(\d{2})_(\d{2})(?:-(\d{4})_(\d{2})_(\d{2}))?")
+
+
+def ftp_time(s):
+    """Время FTP (UTC, YYYYMMDDHHMMSS) -> локальное без tzinfo."""
+    if not s:
+        return None
+    try:
+        t = datetime.strptime(s[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return t.astimezone().replace(tzinfo=None)
 
 
 # ---------------------------------------------------------------- config ---
@@ -96,6 +115,21 @@ def load_config(path):
         "max_per_run": int(get("main", "max_messages_per_run", "200")),
         "batch_size": max(1, int(get("main", "batch_size", "20"))),
         "log_file": get("main", "log_file", ""),
+        "analyze": get_bool("analyze", "enabled", False),
+        "yolo_model": get("analyze", "model", "yolo11s.pt"),
+        "confidence": float(get("analyze", "confidence", "0.4")),
+        "visit_gap": int(get("analyze", "visit_gap_minutes", "5")),
+        "journal_dir": get("analyze", "journal_dir", "/hikvision/reports"),
+        "report": get_bool("report", "enabled", False),
+        "report_to": get("report", "to", ""),
+        "claude_model": get("report", "claude_model", "claude-opus-5-5"),
+        "max_images": int(get("report", "max_images", "6")),
+        "send_empty": get_bool("report", "send_empty", False),
+        "smtp_host": get("report", "smtp_host", "smtp.gmail.com"),
+        "smtp_port": int(get("report", "smtp_port", "465")),
+        "ipcam_dirs": [d.strip() for d in get("ipcam", "dirs", "").split(",") if d.strip()],
+        "ipcam_lookback": float(get("ipcam", "first_run_lookback_hours", "6")),
+        "ipcam_max": int(get("ipcam", "max_files_per_run", "3000")),
     }
 
 
@@ -252,6 +286,44 @@ class FtpUploader:
         self.ftp.storbinary(f"STOR {remote_path}", io.BytesIO(data))
         return remote_path
 
+    def download(self, remote_path):
+        buf = io.BytesIO()
+        self.ftp.retrbinary(f"RETR {remote_path}", buf.write)
+        return buf.getvalue()
+
+    def listdir(self, path):
+        """[(имя, это_папка, время_изменения_локальное|None)]"""
+        try:
+            out = []
+            for name, facts in self.ftp.mlsd(path, facts=["type", "modify"]):
+                kind = facts.get("type", "")
+                if name in (".", "..") or kind in ("cdir", "pdir"):
+                    continue
+                out.append((name, kind == "dir", ftp_time(facts.get("modify"))))
+            return out
+        except ftplib.error_perm:
+            # сервер без MLSD: папки узнаём по имени-дате, время файлов — через MDTM
+            out = []
+            for full in self.ftp.nlst(path):
+                name = full.rstrip("/").rsplit("/", 1)[-1]
+                if name in (".", ".."):
+                    continue
+                if RE_DATE_DIR.search(name):
+                    out.append((name, True, None))
+                elif name.lower().endswith(IMAGE_EXT):
+                    mdtm = self.ftp.voidcmd(f"MDTM {path.rstrip('/')}/{name}")
+                    out.append((name, False, ftp_time(mdtm.split()[-1])))
+            return out
+
+    def append(self, remote_path, data, header=b""):
+        """Дописать в конец файла (журнал); новый файл начинается с header."""
+        self._ensure_dir(remote_path.rsplit("/", 1)[0])
+        try:
+            self.ftp.size(remote_path)
+        except ftplib.error_perm:
+            data = header + data
+        self.ftp.storbinary(f"APPE {remote_path}", io.BytesIO(data))
+
 
 class FtpPool:
     """Несколько FTP-соединений для параллельной загрузки: основное время
@@ -272,12 +344,22 @@ class FtpPool:
             self._free.put(conn)
         self.size = len(self._all)
 
-    def upload(self, remote_path, data):
+    def call(self, method, *args):
+        """Выполнить метод FtpUploader на свободном соединении."""
         conn = self._free.get()
         try:
-            return conn.upload(remote_path, data)
+            return getattr(conn, method)(*args)
         finally:
             self._free.put(conn)
+
+    def upload(self, remote_path, data):
+        return self.call("upload", remote_path, data)
+
+    def append(self, remote_path, data, header=b""):
+        return self.call("append", remote_path, data, header)
+
+    def download(self, remote_path):
+        return self.call("download", remote_path)
 
     def close(self):
         for conn in self._all:
@@ -295,6 +377,124 @@ def build_remote_path(c, ev, filename):
     return (root.rstrip("/") + "/" + rel.lstrip("/")).replace("//", "/")
 
 
+# --------------------------------------------------------------- analyze ---
+
+def make_detector(c):
+    if not c["analyze"]:
+        return None
+    try:
+        import analyze
+        detector = analyze.Detector(c["yolo_model"], c["confidence"])
+    except ImportError as e:
+        log.warning("Анализ фото выключен: не установлены зависимости (%s)", e)
+        return None
+    log.info("Детектор: %s", c["yolo_model"])
+    return detector
+
+
+def analyze_batch(c, detector, pool, frames, files):
+    """Детектор по фото пачки; кадры с объектами — в журнал на FTP."""
+    import analyze
+    if not files:
+        return
+    try:
+        counts = detector.counts([blob for _, blob, _ in files])
+    except Exception as e:  # анализ не должен ломать загрузку фото
+        log.warning("Анализ пачки не удался: %s", e)
+        return
+    new = [{"time": evi["time"], "camera": evi["camera"], "file": remote,
+            "blob": blob if n else None, "counts": n}
+           for (remote, blob, evi), n in zip(files, counts)]
+    frames.extend(new)
+    log.info("Анализ: кадров %d, с объектами %d", len(new), sum(1 for f in new if f["counts"]))
+    if not pool:
+        return
+    by_day = defaultdict(list)
+    for f in new:
+        if f["counts"]:
+            by_day[f["time"].strftime("%Y-%m-%d")] += analyze.journal_lines([f])
+    for day, lines in by_day.items():
+        path = f"{c['journal_dir'].rstrip('/')}/{day}.csv"
+        try:
+            pool.append(path, "".join(lines).encode("utf-8"),
+                        analyze.JOURNAL_HEADER.encode("utf-8"))
+        except ftplib.all_errors as e:
+            log.warning("Журнал %s не записан: %s", path, e)
+
+
+def send_report(c, frames, dry_run):
+    import analyze
+    try:
+        report = analyze.build_report(c, frames)
+        if not report:
+            return
+        subject, body, keys = report
+        log.info("Отчёт: %s\n%s", subject, body)
+        if dry_run or not c["report_to"]:
+            log.info("Отчёт не отправлен (%s)", "dry-run" if dry_run else "не задан получатель")
+            return
+        analyze.send_mail(c, subject, body, keys)
+        log.info("Отчёт отправлен, приложено кадров: %d", len(keys))
+    except Exception as e:  # фото уже на FTP — ошибка отчёта не должна ронять прогон
+        log.error("Отчёт не отправлен: %s", e)
+
+
+def process_ipcam(c, dry_run, detector, frames):
+    """Новые фото другого регистратора (IPCAM_HOME*/<дата>/<фото>): только читаем
+    и анализируем, на FTP ничего не меняем. Что уже обработано — в ipcam_state.json."""
+    state_path = f"{c['journal_dir'].rstrip('/')}/ipcam_state.json"
+    pool = FtpPool(c, c["ftp_connections"])
+    try:
+        try:
+            state = json.loads(pool.download(state_path).decode("utf-8"))
+        except ftplib.error_perm:
+            state = {}  # первый запуск
+        first_mark = datetime.now() - timedelta(hours=c["ipcam_lookback"])
+        todo = []  # (время, путь, камера, папка)
+        for d in c["ipcam_dirs"]:
+            camera = safe_name(d.rstrip("/").rsplit("/", 1)[-1])
+            mark = datetime.strptime(state[d], "%Y-%m-%d %H:%M:%S") if d in state else first_mark
+            listed_at = datetime.now()
+            found = []
+            for name, is_dir, _ in pool.call("listdir", d):
+                m = RE_DATE_DIR.search(name)
+                if not (is_dir and m):
+                    continue
+                y, mo, dd = m.group(4, 5, 6) if m.group(4) else m.group(1, 2, 3)
+                if datetime(int(y), int(mo), int(dd)).date() < mark.date():
+                    continue  # папка целиком старше отметки
+                sub = f"{d.rstrip('/')}/{name}"
+                for fname, fdir, t in pool.call("listdir", sub):
+                    if not fdir and fname.lower().endswith(IMAGE_EXT) and t and t > mark:
+                        found.append((t, f"{sub}/{fname}", camera, d))
+            log.info("IPCAM %s: новых фото %d (после %s)", camera, len(found), f"{mark:%d.%m %H:%M}")
+            if not found:
+                # ничего нового — сдвигаем отметку, чтобы не листать старое заново
+                state[d] = max(mark, listed_at - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+            todo += found
+        todo.sort()
+        if len(todo) > c["ipcam_max"]:
+            log.warning("IPCAM: новых фото %d, берём первые %d — остальные в следующий раз",
+                        len(todo), c["ipcam_max"])
+            todo = todo[:c["ipcam_max"]]
+
+        with ThreadPoolExecutor(max_workers=pool.size) as ex:
+            for i in range(0, len(todo), 48):
+                chunk = todo[i:i + 48]
+                blobs = list(ex.map(lambda x: pool.download(x[1]), chunk))
+                analyze_batch(c, detector, None if dry_run else pool, frames,
+                              [(path, blob, {"time": t, "camera": cam})
+                               for (t, path, cam, _), blob in zip(chunk, blobs)])
+                for t, _, _, d in chunk:  # todo отсортирован — последний и есть отметка
+                    state[d] = t.strftime("%Y-%m-%d %H:%M:%S")
+    finally:
+        try:
+            if not dry_run and "state" in locals():
+                pool.upload(state_path, json.dumps(state, ensure_ascii=False, indent=1).encode("utf-8"))
+        finally:
+            pool.close()
+
+
 # ------------------------------------------------------------------ imap ---
 
 def imap_quote(s):
@@ -302,6 +502,22 @@ def imap_quote(s):
 
 
 def run_once(c, dry_run=False):
+    detector = make_detector(c)
+    frames = []  # кадры для отчёта: {time, camera, file, blob, counts}
+    process_mail(c, dry_run, detector, frames)
+    if c["ipcam_dirs"]:
+        if detector:
+            try:
+                process_ipcam(c, dry_run, detector, frames)
+            except ftplib.all_errors as e:  # почта уже обработана — отчёт всё равно шлём
+                log.error("IPCAM: ошибка FTP: %s", e)
+        else:
+            log.info("IPCAM: анализ выключен — папки не проверяем")
+    if frames and c["report"]:
+        send_report(c, frames, dry_run)
+
+
+def process_mail(c, dry_run, detector, frames):
     imap = imaplib.IMAP4_SSL(c["imap_host"], c["imap_port"])
     try:
         imap.login(c["imap_user"], c["imap_password"])
@@ -334,7 +550,7 @@ def run_once(c, dry_run=False):
                 for start in range(0, len(uids), c["batch_size"]):
                     # 1. Забираем пачку писем.
                     # BODY.PEEK — не помечает письмо прочитанным до успешной загрузки
-                    batch = []  # [(uid, [(remote, blob), ...])]
+                    batch = []  # [(uid, [(remote, blob, event), ...])]
                     for uid in uids[start:start + c["batch_size"]]:
                         typ, msg_data = imap.uid("FETCH", uid, "(BODY.PEEK[])")
                         raw = next((p[1] for p in msg_data if isinstance(p, tuple)), None)
@@ -347,50 +563,57 @@ def run_once(c, dry_run=False):
                         if not images:
                             log.info("UID %s «%s»: картинок нет, пропуск",
                                      uid.decode(), str(msg.get("Subject", "")))
-                        files = [(build_remote_path(c, event_for_image(ev, fname), fname), blob)
-                                 for fname, blob in images]
+                        files = []
+                        for fname, blob in images:
+                            evi = event_for_image(ev, fname)
+                            files.append((build_remote_path(c, evi, fname), blob, evi))
                         batch.append((uid, files))
 
                     # 2. Все фото пачки — параллельно по нескольким соединениям
                     failed, first_err = set(), None
                     if dry_run:
                         for uid, files in batch:
-                            for remote, blob in files:
+                            for remote, blob, _ in files:
                                 log.info("[dry-run] %s (%d байт)", remote, len(blob))
                                 uploaded_total += 1
-                        continue
-                    jobs = [(ex.submit(pool.upload, remote, blob), uid, remote, len(blob))
-                            for uid, files in batch for remote, blob in files]
-                    for fut, uid, remote, size in jobs:
-                        try:
-                            fut.result()
-                            log.info("Загружено: %s (%d байт)", remote, size)
-                            uploaded_total += 1
-                        except ftplib.all_errors as e:
-                            log.error("UID %s: ошибка FTP %s: %s — письмо оставлено непрочитанным",
-                                      uid.decode(), remote, e)
-                            failed.add(uid)
-                            first_err = first_err or e
+                    else:
+                        jobs = [(ex.submit(pool.upload, remote, blob), uid, remote, len(blob))
+                                for uid, files in batch for remote, blob, _ in files]
+                        for fut, uid, remote, size in jobs:
+                            try:
+                                fut.result()
+                                log.info("Загружено: %s (%d байт)", remote, size)
+                                uploaded_total += 1
+                            except ftplib.all_errors as e:
+                                log.error("UID %s: ошибка FTP %s: %s — письмо оставлено непрочитанным",
+                                          uid.decode(), remote, e)
+                                failed.add(uid)
+                                first_err = first_err or e
 
-                    # 3. Помечаем/удаляем только письма, все фото которых уже на FTP;
-                    # письма без картинок (потеря видео, ошибка диска...) не удаляются.
-                    # Одна команда на всю пачку вместо трёх на каждое письмо.
-                    done = [uid for uid, files in batch if uid not in failed]
-                    trash = [uid for uid, files in batch if uid not in failed and files]
-                    if done:
-                        uidset = b",".join(done).decode()
-                        imap.uid("STORE", uidset, "+FLAGS", "(\\Seen)")
-                        if c["done_label"] and is_gmail:
-                            imap.uid("STORE", uidset, "+X-GM-LABELS", imap_quote(c["done_label"]))
-                    if c["delete_after"] and trash:
-                        uidset = b",".join(trash).decode()
-                        if is_gmail:
-                            # В Gmail — в Корзину (очищается сама через 30 дней)
-                            imap.uid("STORE", uidset, "+X-GM-LABELS", "(\\Trash)")
-                        else:
-                            imap.uid("STORE", uidset, "+FLAGS", "(\\Deleted)")
-                            need_expunge = True
-                        deleted += len(trash)
+                        # 3. Помечаем/удаляем только письма, все фото которых уже на FTP;
+                        # письма без картинок (потеря видео, ошибка диска...) не удаляются.
+                        # Одна команда на всю пачку вместо трёх на каждое письмо.
+                        done = [uid for uid, files in batch if uid not in failed]
+                        trash = [uid for uid, files in batch if uid not in failed and files]
+                        if done:
+                            uidset = b",".join(done).decode()
+                            imap.uid("STORE", uidset, "+FLAGS", "(\\Seen)")
+                            if c["done_label"] and is_gmail:
+                                imap.uid("STORE", uidset, "+X-GM-LABELS", imap_quote(c["done_label"]))
+                        if c["delete_after"] and trash:
+                            uidset = b",".join(trash).decode()
+                            if is_gmail:
+                                # В Gmail — в Корзину (очищается сама через 30 дней)
+                                imap.uid("STORE", uidset, "+X-GM-LABELS", "(\\Trash)")
+                            else:
+                                imap.uid("STORE", uidset, "+FLAGS", "(\\Deleted)")
+                                need_expunge = True
+                            deleted += len(trash)
+
+                    # 4. Анализ кадров пачки (люди/машины/собаки/кошки) + журнал на FTP
+                    if detector:
+                        analyze_batch(c, detector, pool, frames,
+                                      [f for uid, files in batch if uid not in failed for f in files])
                     if first_err:
                         raise first_err
         finally:
