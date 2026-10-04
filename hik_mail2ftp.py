@@ -45,6 +45,11 @@ RE_EVENT_TYPE = re.compile(r"EVENT\s*TYPE\s*:\s*(.+)", re.I)
 RE_EVENT_TIME = re.compile(r"EVENT\s*TIME\s*:\s*(\d{4}-\d{2}-\d{2})[,\sT]+(\d{2}:\d{2}:\d{2})", re.I)
 RE_CAMERA = re.compile(r"CAMERA\s*NAME(?:\s*\(NUM\))?\s*:\s*(.+)", re.I)
 RE_DEVICE = re.compile(r"(?:NVR|DVR|DEVICE)\s*NAME\s*:\s*(.+)", re.I)
+# Все "Имя(Dn)" в блоке камер — письмо может быть сразу по нескольким каналам:
+#   "Motion Detected On Channel D1 D4"
+RE_CAM_ALL = re.compile(r"([^\n(),:]+?)\s*\(\s*(D\d+)\s*\)", re.I)
+# Канал из имени вложения: "D04-1.jpg" -> D4
+RE_IMG_CH = re.compile(r"^D0*(\d+)[-_]", re.I)
 
 
 # ---------------------------------------------------------------- config ---
@@ -142,13 +147,36 @@ def parse_event(msg):
     channel = first(re.compile(r"\((D?\d+)\)\s*$"), camera) or \
         first(re.compile(r"Channel\s+(\S+)", re.I), subject)
 
+    # Карта канал -> "Camera 04(D4)" по всем камерам из письма
+    cameras = {}
+    i = text.upper().find("CAMERA NAME")
+    if i >= 0:
+        for name, ch in RE_CAM_ALL.findall(text[i:]):
+            key = "D%d" % int(ch[1:])
+            cameras.setdefault(key, f"{name.strip()}({ch})")
+
     return {
         "camera": safe_name(camera or first(RE_CAMERA, subject), "camera"),
         "channel": safe_name(channel, "ch"),
+        "cameras": cameras,
         "event": safe_name(first(RE_EVENT_TYPE, text) or subject, "event"),
         "device": safe_name(first(RE_DEVICE, text), "nvr"),
         "time": ev_time,
     }
+
+
+def event_for_image(ev, filename):
+    """Камера конкретного фото по имени файла (D01-1.jpg -> D1)."""
+    m = RE_IMG_CH.match(filename)
+    if not m:
+        return ev
+    ch = "D%d" % int(m.group(1))
+    if ch == ev["channel"] and ch not in ev["cameras"]:
+        return ev
+    e = dict(ev)
+    e["channel"] = ch
+    e["camera"] = safe_name(ev["cameras"].get(ch, ch))
+    return e
 
 
 def extract_images(msg):
@@ -292,7 +320,7 @@ def run_once(c, dry_run=False):
                 else:
                     try:
                         for fname, blob in images:
-                            remote = build_remote_path(c, ev, fname)
+                            remote = build_remote_path(c, event_for_image(ev, fname), fname)
                             if dry_run:
                                 log.info("[dry-run] %s (%d байт)", remote, len(blob))
                             else:
