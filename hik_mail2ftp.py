@@ -26,9 +26,11 @@ import imaplib
 import io
 import logging
 import os
+import queue
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 
@@ -88,9 +90,11 @@ def load_config(path):
         "ftp_tls": get_bool("ftp", "tls", False),
         "ftp_passive": get_bool("ftp", "passive", True),
         "ftp_root": get("ftp", "root", "/") or "/",
+        "ftp_connections": int(get("ftp", "connections", "4")),
         "path_template": get("ftp", "path_template", "{camera}/{date}/{time}_{filename}"),
         "interval": int(get("main", "interval_seconds", "60")),
         "max_per_run": int(get("main", "max_messages_per_run", "200")),
+        "batch_size": max(1, int(get("main", "batch_size", "20"))),
         "log_file": get("main", "log_file", ""),
     }
 
@@ -241,24 +245,43 @@ class FtpUploader:
                     raise  # 550/521 = уже существует
             self._made.add(cur)
 
-    def _exists(self, path):
-        try:
-            self.ftp.size(path)
-            return True
-        except ftplib.all_errors:
-            return False
+    def upload(self, remote_path, data):
+        # Имя уникально (время события + номер кадра); при повторной обработке
+        # письма файл просто перезапишется тем же фото
+        self._ensure_dir(remote_path.rsplit("/", 1)[0])
+        self.ftp.storbinary(f"STOR {remote_path}", io.BytesIO(data))
+        return remote_path
+
+
+class FtpPool:
+    """Несколько FTP-соединений для параллельной загрузки: основное время
+    уходит на задержку сети на каждый файл, а не на передачу данных."""
+
+    def __init__(self, c, size):
+        self._free = queue.Queue()
+        self._all = []
+        for _ in range(max(1, size)):
+            try:
+                conn = FtpUploader(c).__enter__()
+            except ftplib.all_errors as e:
+                if not self._all:
+                    raise
+                log.warning("FTP: открыто соединений %d из %d (%s)", len(self._all), size, e)
+                break
+            self._all.append(conn)
+            self._free.put(conn)
+        self.size = len(self._all)
 
     def upload(self, remote_path, data):
-        d, base = remote_path.rsplit("/", 1)
-        self._ensure_dir(d)
-        # не перезатираем файл с тем же именем
-        stem, ext = os.path.splitext(base)
-        target, n = remote_path, 1
-        while self._exists(target):
-            target = f"{d}/{stem}_{n}{ext}"
-            n += 1
-        self.ftp.storbinary(f"STOR {target}", io.BytesIO(data))
-        return target
+        conn = self._free.get()
+        try:
+            return conn.upload(remote_path, data)
+        finally:
+            self._free.put(conn)
+
+    def close(self):
+        for conn in self._all:
+            conn.__exit__(None, None, None)
 
 
 def build_remote_path(c, ev, filename):
@@ -302,52 +325,74 @@ def run_once(c, dry_run=False):
         deleted, need_expunge = 0, False
 
         uploaded_total = 0
-        uploader = None if dry_run else FtpUploader(c).__enter__()
+        pool = None
+        if not dry_run:
+            pool = FtpPool(c, c["ftp_connections"])
+            log.info("FTP-соединений: %d", pool.size)
         try:
-            for uid in uids:
-                # BODY.PEEK — не помечает письмо прочитанным до успешной загрузки
-                typ, msg_data = imap.uid("FETCH", uid, "(BODY.PEEK[])")
-                raw = next((p[1] for p in msg_data if isinstance(p, tuple)), None)
-                if typ != "OK" or raw is None:
-                    log.warning("UID %s: не удалось получить письмо", uid.decode())
-                    continue
-                msg = email.message_from_bytes(raw, policy=email.policy.default)
-                ev = parse_event(msg)
-                images = extract_images(msg)
-                subj = str(msg.get("Subject", ""))
-                if not images:
-                    log.info("UID %s «%s»: картинок нет, пропуск", uid.decode(), subj)
-                else:
-                    try:
-                        for fname, blob in images:
-                            remote = build_remote_path(c, event_for_image(ev, fname), fname)
-                            if dry_run:
+            with ThreadPoolExecutor(max_workers=pool.size if pool else 1) as ex:
+                for start in range(0, len(uids), c["batch_size"]):
+                    # 1. Забираем пачку писем.
+                    # BODY.PEEK — не помечает письмо прочитанным до успешной загрузки
+                    batch = []  # [(uid, [(remote, blob), ...])]
+                    for uid in uids[start:start + c["batch_size"]]:
+                        typ, msg_data = imap.uid("FETCH", uid, "(BODY.PEEK[])")
+                        raw = next((p[1] for p in msg_data if isinstance(p, tuple)), None)
+                        if typ != "OK" or raw is None:
+                            log.warning("UID %s: не удалось получить письмо", uid.decode())
+                            continue
+                        msg = email.message_from_bytes(raw, policy=email.policy.default)
+                        ev = parse_event(msg)
+                        images = extract_images(msg)
+                        if not images:
+                            log.info("UID %s «%s»: картинок нет, пропуск",
+                                     uid.decode(), str(msg.get("Subject", "")))
+                        files = [(build_remote_path(c, event_for_image(ev, fname), fname), blob)
+                                 for fname, blob in images]
+                        batch.append((uid, files))
+
+                    # 2. Все фото пачки — параллельно по нескольким соединениям
+                    failed, first_err = set(), None
+                    if dry_run:
+                        for uid, files in batch:
+                            for remote, blob in files:
                                 log.info("[dry-run] %s (%d байт)", remote, len(blob))
-                            else:
-                                remote = uploader.upload(remote, blob)
-                                log.info("Загружено: %s (%d байт)", remote, len(blob))
+                                uploaded_total += 1
+                        continue
+                    jobs = [(ex.submit(pool.upload, remote, blob), uid, remote, len(blob))
+                            for uid, files in batch for remote, blob in files]
+                    for fut, uid, remote, size in jobs:
+                        try:
+                            fut.result()
+                            log.info("Загружено: %s (%d байт)", remote, size)
                             uploaded_total += 1
-                    except ftplib.all_errors as e:
-                        log.error("UID %s: ошибка FTP: %s — письмо оставлено непрочитанным",
-                                  uid.decode(), e)
-                        raise
-                if not dry_run:
-                    imap.uid("STORE", uid, "+FLAGS", "(\\Seen)")
-                    if c["done_label"] and is_gmail:
-                        imap.uid("STORE", uid, "+X-GM-LABELS", imap_quote(c["done_label"]))
-                    # Удаляем только письма, фото из которых уже на FTP;
-                    # письма без картинок (потеря видео, ошибка диска...) остаются
-                    if c["delete_after"] and images:
-                        if is_gmail:
-                            # В Gmail — в Корзину (очищается сама через 30 дней)
-                            imap.uid("STORE", uid, "+X-GM-LABELS", "(\\Trash)")
-                        else:
-                            imap.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
-                            need_expunge = True
-                        deleted += 1
+                        except ftplib.all_errors as e:
+                            log.error("UID %s: ошибка FTP %s: %s — письмо оставлено непрочитанным",
+                                      uid.decode(), remote, e)
+                            failed.add(uid)
+                            first_err = first_err or e
+
+                    # 3. Помечаем/удаляем только письма, все фото которых уже на FTP;
+                    # письма без картинок (потеря видео, ошибка диска...) не удаляются
+                    for uid, files in batch:
+                        if uid in failed:
+                            continue
+                        imap.uid("STORE", uid, "+FLAGS", "(\\Seen)")
+                        if c["done_label"] and is_gmail:
+                            imap.uid("STORE", uid, "+X-GM-LABELS", imap_quote(c["done_label"]))
+                        if c["delete_after"] and files:
+                            if is_gmail:
+                                # В Gmail — в Корзину (очищается сама через 30 дней)
+                                imap.uid("STORE", uid, "+X-GM-LABELS", "(\\Trash)")
+                            else:
+                                imap.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+                                need_expunge = True
+                            deleted += 1
+                    if first_err:
+                        raise first_err
         finally:
-            if uploader:
-                uploader.__exit__(None, None, None)
+            if pool:
+                pool.close()
             if need_expunge:
                 imap.expunge()
             if deleted:
