@@ -373,21 +373,24 @@ def run_once(c, dry_run=False):
                             first_err = first_err or e
 
                     # 3. Помечаем/удаляем только письма, все фото которых уже на FTP;
-                    # письма без картинок (потеря видео, ошибка диска...) не удаляются
-                    for uid, files in batch:
-                        if uid in failed:
-                            continue
-                        imap.uid("STORE", uid, "+FLAGS", "(\\Seen)")
+                    # письма без картинок (потеря видео, ошибка диска...) не удаляются.
+                    # Одна команда на всю пачку вместо трёх на каждое письмо.
+                    done = [uid for uid, files in batch if uid not in failed]
+                    trash = [uid for uid, files in batch if uid not in failed and files]
+                    if done:
+                        uidset = b",".join(done).decode()
+                        imap.uid("STORE", uidset, "+FLAGS", "(\\Seen)")
                         if c["done_label"] and is_gmail:
-                            imap.uid("STORE", uid, "+X-GM-LABELS", imap_quote(c["done_label"]))
-                        if c["delete_after"] and files:
-                            if is_gmail:
-                                # В Gmail — в Корзину (очищается сама через 30 дней)
-                                imap.uid("STORE", uid, "+X-GM-LABELS", "(\\Trash)")
-                            else:
-                                imap.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
-                                need_expunge = True
-                            deleted += 1
+                            imap.uid("STORE", uidset, "+X-GM-LABELS", imap_quote(c["done_label"]))
+                    if c["delete_after"] and trash:
+                        uidset = b",".join(trash).decode()
+                        if is_gmail:
+                            # В Gmail — в Корзину (очищается сама через 30 дней)
+                            imap.uid("STORE", uidset, "+X-GM-LABELS", "(\\Trash)")
+                        else:
+                            imap.uid("STORE", uidset, "+FLAGS", "(\\Deleted)")
+                            need_expunge = True
+                        deleted += len(trash)
                     if first_err:
                         raise first_err
         finally:
