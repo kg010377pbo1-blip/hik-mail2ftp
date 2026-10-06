@@ -118,6 +118,7 @@ PROMPT = """Ты помощник охраны частного участка. 
 {table}
 
 Выше приложены ключевые кадры — первые кадры некоторых визитов.
+{pets}
 
 Напиши короткий отчёт на русском (до 15 строк, простой текст без таблиц и markdown):
 - главное: когда и где появлялись люди, машины, собаки, кошки, сколько раз;
@@ -136,9 +137,14 @@ def claude_text(c, period, vs, frames, keys):
         content.append({"type": "image", "source": {
             "type": "base64", "media_type": "image/jpeg",
             "data": base64.standard_b64encode(f["blob"]).decode()}})
+    pets = ""
+    if c.get("pets"):
+        pets = ("\nНа участке живут свои собаки — это не посторонние. Называй их по именам, "
+                "если узнаёшь на кадре; если по кадру не различить (например, две рыжие) — "
+                "так и скажи:\n" + c["pets"] + "\n")
     content.append({"type": "text", "text": PROMPT.format(
         period=period, cameras=", ".join(sorted({f["camera"] for f in frames})),
-        frames=len(frames), gap=c["visit_gap"], table=visits_table(vs))})
+        frames=len(frames), gap=c["visit_gap"], table=visits_table(vs), pets=pets)})
     resp = client.beta.messages.create(
         model=c["claude_model"],
         max_tokens=8000,
