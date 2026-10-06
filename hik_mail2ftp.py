@@ -125,6 +125,7 @@ def load_config(path):
         "claude_model": get("report", "claude_model", "claude-opus-5-5"),
         "max_images": int(get("report", "max_images", "6")),
         "send_empty": get_bool("report", "send_empty", False),
+        "pets": get("report", "pets", ""),
         "smtp_host": get("report", "smtp_host", "smtp.gmail.com"),
         "smtp_port": int(get("report", "smtp_port", "465")),
         "ipcam_dirs": [d.strip() for d in get("ipcam", "dirs", "").split(",") if d.strip()],
