@@ -442,7 +442,7 @@ def send_report(c, frames, dry_run):
         if not report:
             return
         subject, body, keys = report
-        log.info("Отчёт: %s\n%s", subject, body)
+        log.info("Отчёт: %s", subject)  # текст отчёта — только в письме: логи Actions публичны
         if dry_run or not c["report_to"]:
             log.info("Отчёт не отправлен (%s)", "dry-run" if dry_run else "не задан получатель")
             return
