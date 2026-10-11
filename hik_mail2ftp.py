@@ -131,6 +131,9 @@ def load_config(path):
         "ipcam_dirs": [d.strip() for d in get("ipcam", "dirs", "").split(",") if d.strip()],
         "ipcam_lookback": float(get("ipcam", "first_run_lookback_hours", "6")),
         "ipcam_max": int(get("ipcam", "max_files_per_run", "3000")),
+        "cleanup_dirs": [d.strip() for d in get("ipcam", "cleanup_dirs", "").split(",") if d.strip()],
+        "quarantine_suffix": get("ipcam", "quarantine_suffix", "_empty"),
+        "quarantine_days": float(get("ipcam", "quarantine_days", "3")),
     }
 
 
@@ -268,9 +271,9 @@ class FtpUploader:
                 pass
 
     def _ensure_dir(self, path):
-        cur = ""
+        cur = "/" if path.startswith("/") else ""  # относительный путь — от домашней папки
         for seg in [p for p in path.split("/") if p]:
-            cur += "/" + seg
+            cur = cur + seg if cur in ("", "/") else cur + "/" + seg
             if cur in self._made:
                 continue
             try:
@@ -291,6 +294,13 @@ class FtpUploader:
         buf = io.BytesIO()
         self.ftp.retrbinary(f"RETR {remote_path}", buf.write)
         return buf.getvalue()
+
+    def move(self, src, dst):
+        self._ensure_dir(dst.rsplit("/", 1)[0])
+        self.ftp.rename(src, dst)
+
+    def delete(self, path):
+        self.ftp.delete(path)
 
     def listdir(self, path):
         """[(имя, это_папка, время_изменения_локальное|None)]"""
@@ -394,22 +404,23 @@ def make_detector(c):
 
 
 def analyze_batch(c, detector, pool, frames, files):
-    """Детектор по фото пачки; кадры с объектами — в журнал на FTP."""
+    """Детектор по фото пачки; кадры с объектами — в журнал на FTP.
+    Возвращает новые кадры (в порядке files) или None, если анализ не удался."""
     import analyze
     if not files:
-        return
+        return []
     try:
         counts = detector.counts([blob for _, blob, _ in files])
     except Exception as e:  # анализ не должен ломать загрузку фото
         log.warning("Анализ пачки не удался: %s", e)
-        return
+        return None
     new = [{"time": evi["time"], "camera": evi["camera"], "file": remote,
             "blob": blob if n else None, "counts": n}
            for (remote, blob, evi), n in zip(files, counts)]
     frames.extend(new)
     log.info("Анализ: кадров %d, с объектами %d", len(new), sum(1 for f in new if f["counts"]))
     if not pool:
-        return
+        return new
     by_day = defaultdict(list)
     for f in new:
         if f["counts"]:
@@ -421,6 +432,7 @@ def analyze_batch(c, detector, pool, frames, files):
                         analyze.JOURNAL_HEADER.encode("utf-8"))
         except ftplib.all_errors as e:
             log.warning("Журнал %s не записан: %s", path, e)
+    return new
 
 
 def send_report(c, frames, dry_run):
@@ -440,9 +452,79 @@ def send_report(c, frames, dry_run):
         log.error("Отчёт не отправлен: %s", e)
 
 
+def walk_images(pool, path, mark=None, depth=3):
+    """[(время, путь)] фото в папке и подпапках (до depth уровней), новее mark.
+    Папки-даты старше mark пропускаются целиком."""
+    out = []
+    for name, is_dir, t in pool.call("listdir", path):
+        full = f"{path.rstrip('/')}/{name}"
+        if is_dir:
+            m = RE_DATE_DIR.search(name)
+            if depth <= 0:
+                continue
+            if m and mark:
+                y, mo, dd = m.group(4, 5, 6) if m.group(4) else m.group(1, 2, 3)
+                if datetime(int(y), int(mo), int(dd)).date() < mark.date():
+                    continue
+            out += walk_images(pool, full, mark, depth - 1)
+        elif name.lower().endswith(IMAGE_EXT) and t and (mark is None or t > mark):
+            out.append((t, full))
+    return out
+
+
+def quarantine_path(c, d, path):
+    """IPCAM_HOME4/2026_10_11/x.jpg -> IPCAM_HOME4_empty/2026_10_11/x.jpg"""
+    root = d.rstrip("/")
+    return root + c["quarantine_suffix"] + path[len(root):]
+
+
+def quarantine(c, pool, ex, empty, dry_run):
+    """Снимки без людей/машин/собак/кошек — в карантинную папку рядом."""
+    if not empty:
+        return
+    if dry_run:
+        log.info("[dry-run] в карантин ушло бы снимков: %d", len(empty))
+        return
+
+    def move(item):
+        path, d = item
+        try:
+            pool.call("move", path, quarantine_path(c, d, path))
+            return True
+        except ftplib.all_errors as e:
+            log.warning("Не перенесён в карантин %s: %s", path, e)
+            return False
+
+    log.info("В карантин перенесено пустых снимков: %d из %d", sum(ex.map(move, empty)), len(empty))
+
+
+def purge_quarantine(c, pool, dry_run):
+    """Окончательно удаляет из карантина снимки старше quarantine_days."""
+    cutoff = datetime.now() - timedelta(days=c["quarantine_days"])
+    for d in c["cleanup_dirs"]:
+        q = d.rstrip("/") + c["quarantine_suffix"]
+        try:
+            old = [p for t, p in walk_images(pool, q) if t < cutoff]
+        except ftplib.error_perm:
+            continue  # карантина ещё нет
+        if not old:
+            continue
+        if dry_run:
+            log.info("[dry-run] из %s удалилось бы старых снимков: %d", q, len(old))
+            continue
+        deleted = 0
+        for p in old:
+            try:
+                pool.call("delete", p)
+                deleted += 1
+            except ftplib.all_errors as e:
+                log.warning("Не удалён %s: %s", p, e)
+        log.info("Карантин %s: удалено снимков старше %g дн.: %d", q, c["quarantine_days"], deleted)
+
+
 def process_ipcam(c, dry_run, detector, frames):
-    """Новые фото другого регистратора (IPCAM_HOME*/<дата>/<фото>): только читаем
-    и анализируем, на FTP ничего не меняем. Что уже обработано — в ipcam_state.json."""
+    """Новые фото камер в папках IPCAM_HOME* на FTP: анализируем; в папках из
+    cleanup_dirs пустые снимки уходят в карантин. Что уже обработано — в ipcam_state.json."""
     state_path = f"{c['journal_dir'].rstrip('/')}/ipcam_state.json"
     pool = FtpPool(c, c["ftp_connections"])
     try:
@@ -450,24 +532,18 @@ def process_ipcam(c, dry_run, detector, frames):
             state = json.loads(pool.download(state_path).decode("utf-8"))
         except ftplib.error_perm:
             state = {}  # первый запуск
+        purge_quarantine(c, pool, dry_run)
         first_mark = datetime.now() - timedelta(hours=c["ipcam_lookback"])
         todo = []  # (время, путь, камера, папка)
         for d in c["ipcam_dirs"]:
             camera = safe_name(d.rstrip("/").rsplit("/", 1)[-1])
             mark = datetime.strptime(state[d], "%Y-%m-%d %H:%M:%S") if d in state else first_mark
             listed_at = datetime.now()
-            found = []
-            for name, is_dir, _ in pool.call("listdir", d):
-                m = RE_DATE_DIR.search(name)
-                if not (is_dir and m):
-                    continue
-                y, mo, dd = m.group(4, 5, 6) if m.group(4) else m.group(1, 2, 3)
-                if datetime(int(y), int(mo), int(dd)).date() < mark.date():
-                    continue  # папка целиком старше отметки
-                sub = f"{d.rstrip('/')}/{name}"
-                for fname, fdir, t in pool.call("listdir", sub):
-                    if not fdir and fname.lower().endswith(IMAGE_EXT) and t and t > mark:
-                        found.append((t, f"{sub}/{fname}", camera, d))
+            try:
+                found = [(t, path, camera, d) for t, path in walk_images(pool, d, mark)]
+            except ftplib.error_perm as e:
+                log.warning("IPCAM %s: папка недоступна (%s)", camera, e)
+                continue
             log.info("IPCAM %s: новых фото %d (после %s)", camera, len(found), f"{mark:%d.%m %H:%M}")
             if not found:
                 # ничего нового — сдвигаем отметку, чтобы не листать старое заново
@@ -483,9 +559,13 @@ def process_ipcam(c, dry_run, detector, frames):
             for i in range(0, len(todo), 48):
                 chunk = todo[i:i + 48]
                 blobs = list(ex.map(lambda x: pool.download(x[1]), chunk))
-                analyze_batch(c, detector, None if dry_run else pool, frames,
-                              [(path, blob, {"time": t, "camera": cam})
-                               for (t, path, cam, _), blob in zip(chunk, blobs)])
+                new = analyze_batch(c, detector, None if dry_run else pool, frames,
+                                    [(path, blob, {"time": t, "camera": cam})
+                                     for (t, path, cam, _), blob in zip(chunk, blobs)])
+                if new is not None:  # анализ не удался — ничего не трогаем
+                    empty = [(f["file"], d) for f, (_, _, _, d) in zip(new, chunk)
+                             if not f["counts"] and d in c["cleanup_dirs"]]
+                    quarantine(c, pool, ex, empty, dry_run)
                 for t, _, _, d in chunk:  # todo отсортирован — последний и есть отметка
                     state[d] = t.strftime("%Y-%m-%d %H:%M:%S")
     finally:
