@@ -416,7 +416,7 @@ def analyze_batch(c, detector, pool, frames, files):
     except Exception as e:  # анализ не должен ломать загрузку фото
         log.warning("Анализ пачки не удался: %s", e)
         return None
-    # n is None — снимок не читается: в отчёт не идёт и в карантин не переносится
+    # n is None — снимок не читается (оборванная загрузка): в отчёт не идёт
     new = [{"time": evi["time"], "camera": evi["camera"], "file": remote,
             "blob": blob if n else None, "counts": n or {}, "bad": n is None}
            for (remote, blob, evi), n in zip(files, counts)]
@@ -574,8 +574,10 @@ def process_ipcam(c, dry_run, detector, frames):
                                     [(path, blob, {"time": t, "camera": cam})
                                      for (t, path, cam, _), blob in zip(chunk, blobs)])
                 if new is not None:  # анализ не удался — ничего не трогаем
+                    # пустые и нечитаемые: моложе 3 минут сюда не попадают, значит
+                    # нечитаемый снимок испорчен окончательно
                     empty = [(f["file"], d) for f, (_, _, _, d) in zip(new, chunk)
-                             if not f["counts"] and not f["bad"] and d in c["cleanup_dirs"]]
+                             if not f["counts"] and d in c["cleanup_dirs"]]
                     quarantine(c, pool, ex, empty, dry_run)
                 for t, _, _, d in chunk:  # todo отсортирован — последний и есть отметка
                     state[d] = t.strftime("%Y-%m-%d %H:%M:%S")
