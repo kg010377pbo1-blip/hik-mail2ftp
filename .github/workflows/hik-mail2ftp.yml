@@ -11,6 +11,10 @@ on:
         description: "Только показать, ничего не загружать"
         type: boolean
         default: false
+      ipcam_since:
+        description: "Разово почистить папки IPCAM с даты (ГГГГ-ММ-ДД), пусто — как обычно"
+        type: string
+        default: ""
 
 # Не запускать два прохода одновременно
 concurrency:
@@ -45,6 +49,7 @@ jobs:
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           REPORT_TO: ${{ secrets.REPORT_TO }}
+          IPCAM_SINCE: ${{ inputs.ipcam_since }}
           TZ: Europe/Kyiv
         run: |
           python hik_mail2ftp.py ${{ inputs.dry_run && '--dry-run' || '' }}
