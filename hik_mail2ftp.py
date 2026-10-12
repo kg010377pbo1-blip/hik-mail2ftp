@@ -134,6 +134,8 @@ def load_config(path):
         "cleanup_dirs": [d.strip() for d in get("ipcam", "cleanup_dirs", "").split(",") if d.strip()],
         "quarantine_suffix": get("ipcam", "quarantine_suffix", "_empty"),
         "quarantine_days": float(get("ipcam", "quarantine_days", "3")),
+        # разово (ручной запуск): заново пройти папки чистки начиная с этой даты
+        "ipcam_since": get("ipcam", "since", ""),
     }
 
 
@@ -540,6 +542,11 @@ def process_ipcam(c, dry_run, detector, frames):
         for d in c["ipcam_dirs"]:
             camera = safe_name(d.rstrip("/").rsplit("/", 1)[-1])
             mark = datetime.strptime(state[d], "%Y-%m-%d %H:%M:%S") if d in state else first_mark
+            if c["ipcam_since"] and d in c["cleanup_dirs"]:
+                since = datetime.strptime(c["ipcam_since"][:10], "%Y-%m-%d")
+                if since < mark:
+                    log.info("IPCAM %s: разовый проход с %s", camera, f"{since:%d.%m.%Y}")
+                    mark = since
             # снимки моложе 3 минут камера может ещё дописывать — возьмём в следующий раз
             settled = datetime.now() - timedelta(minutes=3)
             try:
