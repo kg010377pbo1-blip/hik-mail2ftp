@@ -414,11 +414,13 @@ def analyze_batch(c, detector, pool, frames, files):
     except Exception as e:  # анализ не должен ломать загрузку фото
         log.warning("Анализ пачки не удался: %s", e)
         return None
+    # n is None — снимок не читается: в отчёт не идёт и в карантин не переносится
     new = [{"time": evi["time"], "camera": evi["camera"], "file": remote,
-            "blob": blob if n else None, "counts": n}
+            "blob": blob if n else None, "counts": n or {}, "bad": n is None}
            for (remote, blob, evi), n in zip(files, counts)]
     frames.extend(new)
-    log.info("Анализ: кадров %d, с объектами %d", len(new), sum(1 for f in new if f["counts"]))
+    log.info("Анализ: кадров %d, с объектами %d, нечитаемых %d", len(new),
+             sum(1 for f in new if f["counts"]), sum(1 for f in new if f["bad"]))
     if not pool:
         return new
     by_day = defaultdict(list)
@@ -538,16 +540,18 @@ def process_ipcam(c, dry_run, detector, frames):
         for d in c["ipcam_dirs"]:
             camera = safe_name(d.rstrip("/").rsplit("/", 1)[-1])
             mark = datetime.strptime(state[d], "%Y-%m-%d %H:%M:%S") if d in state else first_mark
-            listed_at = datetime.now()
+            # снимки моложе 3 минут камера может ещё дописывать — возьмём в следующий раз
+            settled = datetime.now() - timedelta(minutes=3)
             try:
-                found = [(t, path, camera, d) for t, path in walk_images(pool, d, mark)]
+                found = [(t, path, camera, d) for t, path in walk_images(pool, d, mark)
+                         if t <= settled]
             except ftplib.error_perm as e:
                 log.warning("IPCAM %s: папка недоступна (%s)", camera, e)
                 continue
             log.info("IPCAM %s: новых фото %d (после %s)", camera, len(found), f"{mark:%d.%m %H:%M}")
             if not found:
                 # ничего нового — сдвигаем отметку, чтобы не листать старое заново
-                state[d] = max(mark, listed_at - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+                state[d] = max(mark, settled).strftime("%Y-%m-%d %H:%M:%S")
             todo += found
         todo.sort()
         if len(todo) > c["ipcam_max"]:
@@ -564,7 +568,7 @@ def process_ipcam(c, dry_run, detector, frames):
                                      for (t, path, cam, _), blob in zip(chunk, blobs)])
                 if new is not None:  # анализ не удался — ничего не трогаем
                     empty = [(f["file"], d) for f, (_, _, _, d) in zip(new, chunk)
-                             if not f["counts"] and d in c["cleanup_dirs"]]
+                             if not f["counts"] and not f["bad"] and d in c["cleanup_dirs"]]
                     quarantine(c, pool, ex, empty, dry_run)
                 for t, _, _, d in chunk:  # todo отсортирован — последний и есть отметка
                     state[d] = t.strftime("%Y-%m-%d %H:%M:%S")
