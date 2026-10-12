@@ -34,18 +34,29 @@ class Detector:
         self.confidence = confidence
 
     def counts(self, blobs, chunk=16):
-        """[{kind: count}] для каждого JPEG из blobs."""
+        """[{kind: count} | None] для каждого JPEG из blobs; None — файл не читается
+        (битый или ещё не докачан камерой)."""
         from PIL import Image
-        out = []
+        out = [None] * len(blobs)
         for i in range(0, len(blobs), chunk):
-            imgs = [Image.open(io.BytesIO(b)).convert("RGB") for b in blobs[i:i + chunk]]
-            for r in self.model.predict(imgs, conf=self.confidence, verbose=False):
+            imgs, idx = [], []
+            for j, b in enumerate(blobs[i:i + chunk], start=i):
+                try:
+                    img = Image.open(io.BytesIO(b))
+                    img.load()
+                    imgs.append(img.convert("RGB"))
+                    idx.append(j)
+                except Exception as e:
+                    log.warning("Снимок %d не читается: %s", j, e)
+            if not imgs:
+                continue
+            for j, r in zip(idx, self.model.predict(imgs, conf=self.confidence, verbose=False)):
                 cnt = defaultdict(int)
                 for cls in r.boxes.cls.tolist():
                     kind = KINDS.get(r.names[int(cls)])
                     if kind:
                         cnt[kind] += 1
-                out.append(dict(cnt))
+                out[j] = dict(cnt)
         return out
 
 
