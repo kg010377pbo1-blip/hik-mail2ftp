@@ -128,6 +128,7 @@ def load_config(path):
         "pets": get("report", "pets", ""),
         "smtp_host": get("report", "smtp_host", "smtp.gmail.com"),
         "smtp_port": int(get("report", "smtp_port", "465")),
+        "report_hours": [int(h) for h in get("report", "hours", "8, 20").split(",") if h.strip()],
         "ipcam_dirs": [d.strip() for d in get("ipcam", "dirs", "").split(",") if d.strip()],
         "ipcam_lookback": float(get("ipcam", "first_run_lookback_hours", "6")),
         "ipcam_max": int(get("ipcam", "max_files_per_run", "3000")),
@@ -272,6 +273,10 @@ class FtpUploader:
             except Exception:
                 pass
 
+    def reconnect(self):
+        self.__exit__(None, None, None)
+        self.__enter__()
+
     def _ensure_dir(self, path):
         cur = "/" if path.startswith("/") else ""  # относительный путь — от домашней папки
         for seg in [p for p in path.split("/") if p]:
@@ -328,6 +333,22 @@ class FtpUploader:
                     out.append((name, False, ftp_time(mdtm.split()[-1])))
             return out
 
+    def sizes(self, path):
+        """{имя_файла: размер} в папке (без подпапок)."""
+        try:
+            return {name: int(facts.get("size", 0))
+                    for name, facts in self.ftp.mlsd(path, facts=["type", "size"])
+                    if facts.get("type") == "file"}
+        except ftplib.error_perm:
+            out = {}
+            for full in self.ftp.nlst(path):
+                name = full.rstrip("/").rsplit("/", 1)[-1]
+                try:
+                    out[name] = self.ftp.size(f"{path.rstrip('/')}/{name}")
+                except ftplib.error_perm:
+                    pass  # папка
+            return out
+
     def append(self, remote_path, data, header=b""):
         """Дописать в конец файла (журнал); новый файл начинается с header."""
         self._ensure_dir(remote_path.rsplit("/", 1)[0])
@@ -357,11 +378,25 @@ class FtpPool:
             self._free.put(conn)
         self.size = len(self._all)
 
-    def call(self, method, *args):
+    # обрыв/таймаут — переподключаемся и повторяем; error_perm (нет файла и т.п.) — нет
+    RETRYABLE = (ftplib.error_temp, ftplib.error_reply, ftplib.error_proto, OSError, EOFError)
+
+    def call(self, method, *args, attempts=3):
         """Выполнить метод FtpUploader на свободном соединении."""
         conn = self._free.get()
         try:
-            return getattr(conn, method)(*args)
+            for attempt in range(1, attempts + 1):
+                try:
+                    return getattr(conn, method)(*args)
+                except self.RETRYABLE as e:
+                    if attempt == attempts:
+                        raise
+                    log.warning("FTP %s: %s — переподключаюсь (%d/%d)", method, e, attempt, attempts - 1)
+                    try:
+                        conn.reconnect()
+                    except ftplib.all_errors as e2:
+                        log.warning("FTP: переподключение не удалось: %s", e2)
+                        time.sleep(5)
         finally:
             self._free.put(conn)
 
@@ -416,10 +451,11 @@ def analyze_batch(c, detector, pool, frames, files):
     except Exception as e:  # анализ не должен ломать загрузку фото
         log.warning("Анализ пачки не удался: %s", e)
         return None
-    # n is None — снимок не читается (оборванная загрузка): в отчёт не идёт
+    # n is None — снимок не читается (оборванная загрузка): в отчёт не идёт.
+    # Фото в памяти не держим: отчёт берёт ключевые кадры с FTP по журналу.
     new = [{"time": evi["time"], "camera": evi["camera"], "file": remote,
-            "blob": blob if n else None, "counts": n or {}, "bad": n is None}
-           for (remote, blob, evi), n in zip(files, counts)]
+            "blob": None, "counts": n or {}, "bad": n is None}
+           for (remote, _, evi), n in zip(files, counts)]
     frames.extend(new)
     log.info("Анализ: кадров %d, с объектами %d, нечитаемых %d", len(new),
              sum(1 for f in new if f["counts"]), sum(1 for f in new if f["bad"]))
@@ -439,21 +475,88 @@ def analyze_batch(c, detector, pool, frames, files):
     return new
 
 
-def send_report(c, frames, dry_run):
+def last_slot(now, hours):
+    """Последнее «время отчёта» (из hours, по местному времени), не позже now."""
+    if not hours:
+        return now  # часы не заданы — отчёт после каждого прогона
+    slots = [(now - timedelta(days=d)).replace(hour=h, minute=0, second=0, microsecond=0)
+             for d in (0, 1) for h in hours]
+    return max(t for t in slots if t <= now)
+
+
+def parse_journal(data):
+    """Строки журнала (CSV) -> кадры для отчёта."""
     import analyze
+    frames = []
+    for line in data.decode("utf-8", "replace").splitlines():
+        parts = line.split(",")
+        if len(parts) < 7 or parts[0] == "time":
+            continue
+        try:
+            t = datetime.strptime(parts[0], "%Y-%m-%d %H:%M:%S")
+            nums = [int(x) for x in parts[-4:]]
+        except ValueError:
+            continue
+        frames.append({"time": t, "camera": parts[1], "file": ",".join(parts[2:-4]),
+                       "blob": None, "counts": {k: n for k, n in zip(analyze.ORDER, nums) if n}})
+    return frames
+
+
+def report_step(c, run_frames, dry_run):
+    """Отчёт в часы report_hours (по умолчанию 08:00 и 20:00): всё, что попало
+    в журнал на FTP с прошлого отчёта. Прогоны между отчётами только копят журнал."""
+    import analyze
+    if not c["report"]:
+        return
+    state_path = f"{c['journal_dir'].rstrip('/')}/report_state.json"
     try:
-        report = analyze.build_report(c, frames)
-        if not report:
+        pool = FtpPool(c, 2)
+    except ftplib.all_errors as e:
+        log.error("Отчёт: нет связи с FTP: %s", e)
+        return
+    try:
+        try:
+            st = json.loads(pool.download(state_path).decode("utf-8"))
+        except ftplib.error_perm:
+            st = None
+        sizes = {n: s for n, s in pool.call("sizes", c["journal_dir"]).items() if n.endswith(".csv")}
+        now = datetime.now()
+        stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        if st is None:  # первый запуск: начинаем копить с текущего места журнала
+            log.info("Отчёт: начинаю копить события, первый отчёт — в ближайшее время отчёта")
+            if not dry_run:
+                pool.upload(state_path, json.dumps({"last": stamp, "offsets": sizes, "processed": 0}).encode())
             return
-        subject, body, keys = report
-        log.info("Отчёт: %s", subject)  # текст отчёта — только в письме: логи Actions публичны
-        if dry_run or not c["report_to"]:
-            log.info("Отчёт не отправлен (%s)", "dry-run" if dry_run else "не задан получатель")
+        st["processed"] = st.get("processed", 0) + len(run_frames)
+        last = datetime.strptime(st["last"], "%Y-%m-%d %H:%M:%S")
+        if last >= last_slot(now, c["report_hours"]):
+            log.info("Отчёт: ещё не время (часы отчётов: %s)", ", ".join(f"{h:02d}:00" for h in c["report_hours"]))
+            if not dry_run:
+                pool.upload(state_path, json.dumps(st).encode())
             return
-        analyze.send_mail(c, subject, body, keys)
-        log.info("Отчёт отправлен, приложено кадров: %d", len(keys))
+
+        frames = []  # всё, что дописано в журнал с прошлого отчёта
+        for name, size in sorted(sizes.items()):
+            off = st.get("offsets", {}).get(name, 0)
+            if size > off:
+                frames += parse_journal(pool.download(f"{c['journal_dir'].rstrip('/')}/{name}")[off:])
+        log.info("Отчёт: событий в журнале с %s: %d, кадров обработано: %d",
+                 f"{last:%d.%m %H:%M}", len(frames), st["processed"])
+        report = analyze.build_report(c, frames, total=st["processed"], load_blob=pool.download)
+        if report:
+            subject, body, keys = report
+            log.info("Отчёт: %s", subject)  # текст отчёта — только в письме: логи Actions публичны
+            if dry_run or not c["report_to"]:
+                log.info("Отчёт не отправлен (%s)", "dry-run" if dry_run else "не задан получатель")
+                return
+            analyze.send_mail(c, subject, body, keys)
+            log.info("Отчёт отправлен, приложено кадров: %d", len(keys))
+        if not dry_run:
+            pool.upload(state_path, json.dumps({"last": stamp, "offsets": sizes, "processed": 0}).encode())
     except Exception as e:  # фото уже на FTP — ошибка отчёта не должна ронять прогон
         log.error("Отчёт не отправлен: %s", e)
+    finally:
+        pool.close()
 
 
 def walk_images(pool, path, mark=None, depth=3):
@@ -567,9 +670,16 @@ def process_ipcam(c, dry_run, detector, frames):
             todo = todo[:c["ipcam_max"]]
 
         with ThreadPoolExecutor(max_workers=pool.size) as ex:
-            for i in range(0, len(todo), 48):
-                chunk = todo[i:i + 48]
-                blobs = list(ex.map(lambda x: pool.download(x[1]), chunk))
+            chunks = [todo[i:i + 48] for i in range(0, len(todo), 48)]
+
+            def fetch(chunk):
+                return [ex.submit(pool.download, x[1]) for x in chunk]
+
+            pending = fetch(chunks[0]) if chunks else []
+            for k, chunk in enumerate(chunks):
+                blobs = [f.result() for f in pending]
+                # пока детектор разбирает эту пачку, следующая уже скачивается
+                pending = fetch(chunks[k + 1]) if k + 1 < len(chunks) else []
                 new = analyze_batch(c, detector, None if dry_run else pool, frames,
                                     [(path, blob, {"time": t, "camera": cam})
                                      for (t, path, cam, _), blob in zip(chunk, blobs)])
@@ -607,8 +717,7 @@ def run_once(c, dry_run=False):
                 log.error("IPCAM: ошибка FTP: %s", e)
         else:
             log.info("IPCAM: анализ выключен — папки не проверяем")
-    if frames and c["report"]:
-        send_report(c, frames, dry_run)
+    report_step(c, frames, dry_run)
 
 
 def process_mail(c, dry_run, detector, frames):
