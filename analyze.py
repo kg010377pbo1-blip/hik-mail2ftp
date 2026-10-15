@@ -123,7 +123,7 @@ PROMPT = """Ты помощник охраны частного участка. 
 
 Период: {period}
 Камеры с событиями: {cameras}
-Всего кадров: {frames}
+Кадров с объектами: {frames}
 
 Визиты (объект впервые замечен -> последний кадр перед паузой больше {gap} мин):
 {table}
@@ -171,20 +171,32 @@ def claude_text(c, period, vs, frames, keys):
     return "\n".join(b.text for b in resp.content if b.type == "text").strip() or None
 
 
-def build_report(c, frames):
-    """(тема, текст, ключевые кадры) или None, если ничего не найдено."""
+def build_report(c, frames, total=None, load_blob=None):
+    """(тема, текст, ключевые кадры) или None, если ничего не найдено.
+    load_blob(путь) — догрузить фото ключевого кадра (кадры из журнала без фото)."""
     vs = visits(frames, c["visit_gap"])
     if not vs and not c["send_empty"]:
         log.info("Отчёт: объектов не найдено, письмо не отправляем")
         return None
-    t0 = min(f["time"] for f in frames)
-    t1 = max(f["time"] for f in frames)
-    period = f"{t0:%d.%m %H:%M} – {t1:%d.%m %H:%M}"
+    if frames:
+        t0 = min(f["time"] for f in frames)
+        t1 = max(f["time"] for f in frames)
+        period = f"{t0:%d.%m %H:%M} – {t1:%d.%m %H:%M}"
+    else:
+        period = "—"
     totals = defaultdict(int)
     for v in vs:
         totals[v["kind"]] += 1
     summary = ", ".join(f"{k} {totals[k]}" for k in ORDER if totals[k]) or "никого"
     keys = key_frames(vs, c["max_images"])
+    if load_blob:
+        for v, f in keys:
+            if f.get("blob") is None:
+                try:
+                    f["blob"] = load_blob(f["file"])
+                except Exception as e:
+                    log.warning("Ключевой кадр %s не загружен: %s", f["file"], e)
+        keys = [(v, f) for v, f in keys if f.get("blob")]
 
     text = None
     if vs:
@@ -195,7 +207,7 @@ def build_report(c, frames):
     body = (text or "Объекты по данным детектора (текстовое описание недоступно).")
     if vs:
         body += "\n\n— Детали (визиты) —\n" + visits_table(vs)
-    body += f"\n\nКадров обработано: {len(frames)}"
+    body += f"\n\nКадров обработано: {total if total is not None else len(frames)}"
     return f"Камеры {period}: {summary}", body, keys
 
 
